@@ -12,7 +12,7 @@ $ cargo run --release
 
 or shorthand:
 ```bash
-cargo r -r
+$ cargo r -r
 ```
 
 ## Dummy env
