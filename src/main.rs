@@ -1,11 +1,10 @@
-use actix_web::get;
-use actix_web::post;
-use actix_web::web;
-use actix_web::web::Data;
-use actix_web::App;
-use actix_web::HttpResponse;
-use actix_web::HttpServer;
-use actix_web::Responder;
+use axum::extract::Query;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::routing::get;
+use axum::routing::post;
+use axum::Json;
+use axum::Router;
 use dotenv::dotenv;
 use serde::Deserialize;
 use serde_json::json;
@@ -25,7 +24,7 @@ struct AppState {
     db: Arc<sqlx::PgPool>,
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
 
@@ -49,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         env::var("DB_NAME").unwrap_or("postgres".to_string()),
     );
 
-    println!("Connecting to database: {connection}...");
+    println!("Connecting to database...");
 
     let db = PgPoolOptions::new()
         .max_connections(5)
@@ -64,19 +63,18 @@ async fn main() -> anyhow::Result<()> {
     println!("Connected to database");
 
     let db = Arc::new(db.unwrap());
-    let res = HttpServer::new(move || {
-        App::new()
-            .app_data(Data::new(AppState { db: db.clone() }))
-            .service(index)
-            .service(log)
-            .service(giveme)
-    })
-    .bind((host, port))?
-    .run()
-    .await;
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/log", post(log))
+        .route("/giveme", get(giveme))
+        .with_state(Arc::new(AppState { db: db.clone() }));
 
-    if let Err(err) = res {
-        eprintln!("Error: {err}");
+    let listener = tokio::net::TcpListener::bind(&format!("{host}:{port}"))
+        .await
+        .unwrap();
+
+    if let Err(err) = axum::serve(listener, app).await {
+        eprintln!("Runtime: {err}");
         return Ok(());
     }
 
@@ -89,13 +87,16 @@ struct Log {
     data: HashMap<String, serde_json::Value>,
 }
 
-#[get("/")]
-async fn index() -> impl Responder {
-    HttpResponse::Ok()
+async fn index() -> Json<serde_json::Value> {
+    Json(json!({
+        "message": ":)"
+    }))
 }
 
-#[post("/log")]
-async fn log(req_body: web::Json<Log>, state: web::Data<AppState>) -> impl Responder {
+async fn log(
+    State(state): State<Arc<AppState>>,
+    Json(req_body): Json<Log>,
+) -> Json<serde_json::Value> {
     if let Err(err) = sqlx::query("INSERT INTO logs VALUES($1, $2, $3, $4)")
         .bind(Uuid::new_v4())
         .bind(&req_body.name)
@@ -105,10 +106,12 @@ async fn log(req_body: web::Json<Log>, state: web::Data<AppState>) -> impl Respo
         .await
     {
         eprintln!("Error: {err}");
-        return HttpResponse::InternalServerError().body("Could not log data");
+        return Json(
+            json!({ "status": StatusCode::INTERNAL_SERVER_ERROR.as_u16(), "message": "Could not log data" }),
+        );
     }
 
-    HttpResponse::Ok().body("Success")
+    Json(json!({ "status": 200, "message": "OK" }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,8 +120,10 @@ pub struct GivemeRequest {
     all: Option<bool>,
 }
 
-#[get("/giveme")]
-async fn giveme(query: web::Query<GivemeRequest>, state: web::Data<AppState>) -> impl Responder {
+async fn giveme(
+    Query(query): Query<GivemeRequest>,
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
     let key = std::env::var("KEY").unwrap_or("x".to_string());
     let limit = std::env::var("LIMIT")
         .map(|l| l.parse::<i64>().ok())
@@ -126,7 +131,9 @@ async fn giveme(query: web::Query<GivemeRequest>, state: web::Data<AppState>) ->
         .unwrap();
 
     if query.key.is_none() || query.key.as_ref().unwrap() != key.as_str() {
-        return HttpResponse::Unauthorized().body("Nope");
+        return Json(
+            json!({ "status": StatusCode::UNAUTHORIZED.as_u16(), "message": "Unauthorized" }),
+        );
     }
 
     let query = if query.all.unwrap_or(false) {
@@ -135,24 +142,27 @@ async fn giveme(query: web::Query<GivemeRequest>, state: web::Data<AppState>) ->
         format!("SELECT * FROM logs order by created desc limit {limit}")
     };
 
-    sqlx::query(&query)
-        .fetch_all(&*state.db.borrow())
-        .await
-        .map(|res| {
-            let mut data = Vec::new();
+    let query = sqlx::query(&query).fetch_all(&*state.db.borrow()).await;
 
-            for row in res {
-                data.push(json!({
-                    "id": row.get::<Uuid, _>("id").to_string(),
-                    "name": row.get::<String, _>("name"),
-                    "data": row.get::<serde_json::Value, _>("data"),
-                    "created": row.get::<chrono::DateTime<chrono::Utc>, _>("created"),
-                }));
-            }
+    if let Err(_) = query {
+        return Json(
+            json!({ "status": StatusCode::INTERNAL_SERVER_ERROR.as_u16(), "message": "Could not get data" }),
+        );
+    }
 
-            HttpResponse::Ok().json(json!({
-                "data": data
-            }))
-        })
-        .unwrap_or(HttpResponse::InternalServerError().body("Could not get data"))
+    let res = query.unwrap();
+    let mut data = Vec::<serde_json::Value>::with_capacity(res.len());
+
+    for row in res {
+        data.push(json!({
+            "id": row.get::<Uuid, _>("id").to_string(),
+            "name": row.get::<String, _>("name"),
+            "data": row.get::<serde_json::Value, _>("data"),
+            "created": row.get::<chrono::DateTime<chrono::Utc>, _>("created"),
+        }));
+    }
+
+    println!("Finished building data with {} entries", data.len());
+
+    Json(json!({ "status": StatusCode::OK.as_u16(), "message": "OK", "data": data }))
 }
