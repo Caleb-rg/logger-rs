@@ -5,23 +5,31 @@ use axum::routing::get;
 use axum::routing::post;
 use axum::Json;
 use axum::Router;
+use deadpool_diesel::postgres::Manager;
+use deadpool_diesel::postgres::Pool;
+use diesel::prelude::*;
+use diesel::table;
 use dotenv::dotenv;
 use serde::Deserialize;
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
-use sqlx::types::chrono;
-use sqlx::Row;
-use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::borrow::BorrowMut;
 use std::env;
 use std::sync::Arc;
 use uuid::Uuid;
 
 const DEFAULT_PORT: u16 = 8080;
 
-#[derive(Clone)]
 struct AppState {
-    db: Arc<sqlx::PgPool>,
+    db: Arc<Pool>,
+}
+
+table! {
+    logs (id) {
+        id -> Uuid,
+        name -> Text,
+        data -> Jsonb,
+        created -> Timestamptz,
+    }
 }
 
 #[tokio::main]
@@ -50,10 +58,8 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Connecting to database...");
 
-    let db = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&connection)
-        .await;
+    let manager = Manager::new(connection, deadpool_diesel::Runtime::Tokio1);
+    let db = Pool::builder(manager).max_size(8).build();
 
     if let Err(err) = db {
         eprintln!("Error: {err}");
@@ -67,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(index))
         .route("/log", post(log))
         .route("/giveme", get(giveme))
-        .with_state(Arc::new(AppState { db: db.clone() }));
+        .with_state(Arc::new(AppState { db }));
 
     let listener = tokio::net::TcpListener::bind(&format!("{host}:{port}"))
         .await
@@ -81,10 +87,19 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Identifiable, Queryable, Selectable, Eq, PartialEq)]
+#[diesel(table_name = logs)]
 struct Log {
+    id: Uuid,
     name: String,
-    data: HashMap<String, serde_json::Value>,
+    data: serde_json::Value,
+    created: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Deserialize)]
+struct StrippedLog {
+    name: String,
+    data: serde_json::Value,
 }
 
 async fn index() -> Json<serde_json::Value> {
@@ -95,16 +110,25 @@ async fn index() -> Json<serde_json::Value> {
 
 async fn log(
     State(state): State<Arc<AppState>>,
-    Json(req_body): Json<Log>,
+    Json(req_body): Json<StrippedLog>,
 ) -> Json<serde_json::Value> {
-    if let Err(err) = sqlx::query("INSERT INTO logs VALUES($1, $2, $3, $4)")
-        .bind(Uuid::new_v4())
-        .bind(&req_body.name)
-        .bind(json!(req_body.data))
-        .bind(chrono::Utc::now())
-        .execute(&*state.db.borrow())
-        .await
-    {
+    use logs::dsl;
+
+    let conn = state.db.clone().borrow_mut().get().await.unwrap();
+    let query = conn
+        .interact(move |conn| {
+            diesel::insert_into(dsl::logs)
+                .values((
+                    dsl::id.eq(Uuid::new_v4()),
+                    dsl::name.eq(req_body.name.clone()),
+                    dsl::data.eq(json!(req_body.data)),
+                    dsl::created.eq(chrono::Utc::now()),
+                ))
+                .execute(conn)
+        })
+        .await;
+
+    if let Err(err) = query {
         eprintln!("Error: {err}");
         return Json(
             json!({ "status": StatusCode::INTERNAL_SERVER_ERROR.as_u16(), "message": "Could not log data" }),
@@ -124,6 +148,8 @@ async fn giveme(
     Query(query): Query<GivemeRequest>,
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
+    use self::logs::dsl::*;
+
     let key = std::env::var("KEY").unwrap_or("x".to_string());
     let limit = std::env::var("LIMIT")
         .map(|l| l.parse::<i64>().ok())
@@ -136,33 +162,42 @@ async fn giveme(
         );
     }
 
-    let query = if query.all.unwrap_or(false) {
-        "SELECT * FROM logs order by created desc".to_string()
-    } else {
-        format!("SELECT * FROM logs order by created desc limit {limit}")
-    };
+    let query = state
+        .db
+        .clone()
+        .borrow_mut()
+        .get()
+        .await
+        .unwrap()
+        .interact(move |conn| {
+            if query.all.unwrap_or(false) {
+                logs.select(Log::as_select()).load(conn)
+            } else {
+                logs.limit(limit).select(Log::as_select()).load(conn)
+            }
+        })
+        .await;
 
-    let query = sqlx::query(&query).fetch_all(&*state.db.borrow()).await;
-
-    if let Err(_) = query {
+    if let Err(err) = query {
+        eprintln!("Error: {err}");
         return Json(
             json!({ "status": StatusCode::INTERNAL_SERVER_ERROR.as_u16(), "message": "Could not get data" }),
         );
     }
 
-    let res = query.unwrap();
-    let mut data = Vec::<serde_json::Value>::with_capacity(res.len());
+    let res = query.unwrap().unwrap();
+    let mut response = Vec::<serde_json::Value>::with_capacity(res.len());
 
-    for row in res {
-        data.push(json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "name": row.get::<String, _>("name"),
-            "data": row.get::<serde_json::Value, _>("data"),
-            "created": row.get::<chrono::DateTime<chrono::Utc>, _>("created"),
+    for log in res.into_iter() {
+        response.push(json!({
+            "id": log.id.to_string(),
+            "name": log.name,
+            "data": log.data,
+            "created": log.created,
         }));
     }
 
-    println!("Finished building data with {} entries", data.len());
+    println!("Finished building data with {} entries", response.len());
 
-    Json(json!({ "status": StatusCode::OK.as_u16(), "message": "OK", "data": data }))
+    Json(json!({ "status": StatusCode::OK.as_u16(), "message": "OK", "data": response }))
 }
