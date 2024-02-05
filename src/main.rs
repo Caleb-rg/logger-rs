@@ -13,11 +13,25 @@ use dotenv::dotenv;
 use serde::Deserialize;
 use serde_json::json;
 use std::borrow::BorrowMut;
+use std::cell::RefCell;
 use std::env;
 use std::sync::Arc;
 use uuid::Uuid;
 
 const DEFAULT_PORT: u16 = 8080;
+
+#[derive(Clone)]
+struct EnvVars {
+    key: Arc<String>,
+    limit: i64,
+}
+
+thread_local! {
+    static VARS: RefCell<EnvVars> = RefCell::new(EnvVars {
+        key: Arc::new(std::env::var("KEY").unwrap_or("x".to_string())),
+        limit: std::env::var("LIMIT").map(|l| l.parse::<i64>().ok()).unwrap_or(Some(100)).unwrap(),
+    });
+}
 
 struct AppState {
     db: Arc<Pool>,
@@ -59,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Connecting to database...");
 
     let manager = Manager::new(connection, deadpool_diesel::Runtime::Tokio1);
-    let db = Pool::builder(manager).max_size(8).build();
+    let db = Pool::builder(manager).max_size(4).build();
 
     if let Err(err) = db {
         eprintln!("Error: {err}");
@@ -69,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Connected to database");
 
     let db = Arc::new(db.unwrap());
+
     let app = Router::new()
         .route("/", get(index))
         .route("/log", post(log))
@@ -150,11 +165,7 @@ async fn giveme(
 ) -> Json<serde_json::Value> {
     use self::logs::dsl::*;
 
-    let key = std::env::var("KEY").unwrap_or("x".to_string());
-    let limit = std::env::var("LIMIT")
-        .map(|l| l.parse::<i64>().ok())
-        .unwrap_or(Some(100))
-        .unwrap();
+    let EnvVars { key, limit } = VARS.with(|vars| vars.borrow().clone());
 
     if query.key.is_none() || query.key.as_ref().unwrap() != key.as_str() {
         return Json(
@@ -196,8 +207,6 @@ async fn giveme(
             "created": log.created,
         }));
     }
-
-    println!("Finished building data with {} entries", response.len());
 
     Json(json!({ "status": StatusCode::OK.as_u16(), "message": "OK", "data": response }))
 }
